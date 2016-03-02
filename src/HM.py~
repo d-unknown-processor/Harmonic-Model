@@ -1,0 +1,795 @@
+"""
+written by: Meysam Asgari 15/12/2013 ; CSLU / OHSU
+
+## common speech processing functions
+"""
+
+import numpy as np , pdb ,os , struct
+import scipy.spatial.distance as dist
+from scipy import linalg as LA
+from lib import *
+
+# import matplotlib
+# matplotlib.use("PDF")
+# from matplotlib import mlab as mlab, pylab as plt
+execfile('src/cfg.py')
+
+def Harmonicity ( fn , frames , f0 , fs):
+    N, M = np.shape(frames)
+    I = NUM_BASES_FUN
+    HNR = np.zeros((N, 1))
+    H12 = np.zeros((N, 1))
+    jitter = np.zeros((N, 1))
+    shimmer = np.zeros((N, 1))
+    voicing = np.zeros((N, 1))
+    nH = NUMBER_OF_HARMONICS
+
+    D1 = np.zeros((M,nH*I))
+    D2 = np.zeros((M,nH*I))
+    at = np.zeros((M,nH))
+    bt = np.zeros((M,nH))
+    Acm = np.zeros((nH,1))  # Amplitude constant magnitude 
+    envp = np.zeros((M,1))
+    
+    Basis = Bases (NUM_BASES_FUN , M)
+
+    th = np.asmatrix(range(1,M+1)).transpose() * np.asmatrix(range(1,nH+1))
+    z = np.ones((M, 1))
+    try :LAMBDA_HM = np.loadtxt(fn+'_lambda_HM.txt')
+    except  Exception as Err: LAMBDA_HM = LAMBDA_REG
+    try:  LAMBDA_TVHM = np.loadtxt(fn+'_lambda_TVHM.txt')
+    except  Exception as Err: LAMBDA_TVHM = LAMBDA_REG
+    for i in range(N):
+        if f0[i].item() == 0:
+            continue
+        omega = 2.0 * np.pi * float(f0[i]/fs)
+        tk = th * omega      # M x nH                             
+        Cos = np.cos(tk)
+        Sin = np.sin(tk)
+        iframe = np.asmatrix(frames[i]).transpose()
+        iframe = (iframe - np.mean(iframe)) / np.std(iframe)
+
+       # Harmonics with constant amplitude                         
+        Ac = np.concatenate((z, np.concatenate((Cos, Sin), 1)), 1)
+       # rc = np.max(np.shape(Ac))*np.max(np.linalg.svd(Ac)[1])*eps     
+       # try: hh = np.linalg.pinv(Ac, rcond=rc)          
+        AcT = np.transpose(Ac)
+        try: hh = np.linalg.inv(np.dot(AcT, Ac) + LAMBDA_HM * np.eye(Ac.shape[1]))
+        except np.linalg.LinAlgError, err:
+            logger.warn("Harmonicity: %s, skipping a frame." %err)
+            continue
+        hh = np.dot(hh, AcT)
+        b = np.dot(hh, iframe)
+        for h in range(nH):
+            Acm[h] = np.sqrt(np.square(b[1+h]) + np.square(b[nH+1+h]))
+       # Harmonics with time varying amplitudes, composed of I basis      
+        for t in range(M):
+            for h in range(nH):
+                D1[t][h*I:(h+1)*I] = Cos[t,h] * Basis[t]  # D1: M x (nH*I)    
+                D2[t][h*I:(h+1)*I] = Sin[t,h] * Basis[t]  # D1: M x (nH*I)  
+        At = np.concatenate((z, np.concatenate((D1, D2), 1)), 1)
+       # rc = np.max(np.shape(At))*np.max(np.linalg.svd(At)[1])*eps   
+       # try: hh = np.linalg.pinv(At, rcond=rc)            
+        AtT = np.transpose(At)
+        try: hh = np.linalg.inv(np.dot(AtT, At) + LAMBDA_TVHM * np.eye(At.shape[1]))
+        except np.linalg.LinAlgError, err:
+            logger.warn("Harmonicity: %s, skipping a frame." %err)
+            continue
+        hh = np.dot(hh, AtT)
+        b = np.dot(hh, iframe)
+        denoised = np.dot(At, b)
+        noise = iframe - denoised
+        En = sum(np.square(noise)) / float(M)
+        for t in range(M):
+            for h in range(nH):
+                at[t][h] = np.dot(np.asmatrix(Basis[t]), b[h*I+1:(h+1)*I+1])
+                bt[t][h] = np.dot(np.asmatrix(Basis[t]), b[h*I+1+nH*I:(h+1)*I+1+nH*I])
+
+       # HNR and H12                             
+        fntp = np.square(at) + np.square(bt)
+        Eh = np.sum(fntp)
+        HNR[i] = np.log10(Eh / En + eps)
+        '''if HNR[i] > HNR_VOICING_THRESHOLD:
+              voicing[i] = 1
+           else:
+                HNR[i] = 0
+           continue'''
+        eh1 = sum(np.square(b[1:I+1])) + sum(np.square(b[nH*I+1:(nH+1)*I+1]))
+        eh2 = sum(np.square(b[I+1:2*I+1])) + sum(np.square(b[(nH+1)*I+1:(nH+2)*I+1]))
+        H12[i] = np.log10(eh1 / eh2 + eps)
+
+        shimmer[i] = computeShimmer(fntp, Acm)
+        jitter[i] = computeJitter(denoised, f0[i], fs)
+    return  HNR, H12, shimmer, jitter
+
+def Bases (nbasis , FL):
+        I = nbasis # number of basis functions                          
+        seg = I-1
+        len_b = 2*seg + np.fix(FL/seg)*seg
+        len_w = len_b/seg
+        ham = np.hamming(2*len_w)
+        basis = np.zeros((len_b,I))
+        basis[0:len_w , 0] = ham[len_w  :]
+        for i in range(I-2):
+                basis[i*len_w : i*len_w + 2*len_w ,i+1] = ham
+        basis[len_b-len_w : ,I-1] = ham[0:len_w]
+        bases =  basis[0:int(FL),:]
+        return bases
+
+def genPseudoInvMatsVarToFile( winLen ,Ainv=None , Fmin = F0_MIN , Fmax = F0_MAX , F0=None):
+    global TinvMat
+    TinvMat = TinvMatDir +'TinvMat_'+ TYPE_of_MODEL+'_'+str(fs)+'Hz'+'_'+str(winLen)+'FL'+'_'+'F0res'+str(F0_RES)+'Hz_'+'F0min'+str(F0_MIN)+'Hz_'+'F0max'+str(F0_MAX)+'Hz_'+'nH'+str(NUMBER_OF_HARMONICS)+'_'+WINDOW+'.bin'
+    if not os.path.isfile(TinvMat):
+        
+        pInvMatsVar = []
+        Basis = Bases ( NUM_BASES_FUN , winLen)
+        z = np.ones((winLen, 1))
+        nH = NUMBER_OF_HARMONICS #number of Harmonics     
+        I = len(Basis[0,:])
+        D1 = np.zeros((winLen,nH*I))
+        D2 = np.zeros((winLen,nH*I))
+        fzero= np.arange(Fmin, Fmax+1, F0_RES, dtype=float)
+        T_len = winLen*winLen
+        T_vec = np.empty((T_len*len(fzero) , ))
+        t1= np.arange(1, winLen+1, 1, dtype=float)
+        t1=t1/fs
+        t2=np.arange(0, nH+1, 1, dtype=float)
+        X1, Y1 = np.meshgrid(t2,t1)
+        if WINDOW == 'hanning':
+            win = np.hanning(winLen)
+            W = np.diag(win)
+        elif WINDOW == 'rect':
+            win = np.ones((winLen),)
+            W = np.diag(win)
+        if F0!=None:
+            fzer0 = F0
+        for q in range(len(fzero)):
+            omega=2*np.pi*fzero[q]
+            Cos=np.cos(omega*X1*Y1)    # WIN_LEN x N_HRMNICS 
+            Sin=np.sin(omega*X1*Y1)    # WIN_LEN x N_HRMNICS   
+            # Harmonics with time varying amplitudes, composed of I basis
+            for t in range(winLen):
+                for h in range(nH):
+                    D1[t][h*I:(h+1)*I] = Cos[t,h] * Basis[t]  #D1: M x (nH*I) 
+                    D2[t][h*I:(h+1)*I] = Sin[t,h] * Basis[t]  #D1: M x (nH*I) 
+            A = np.concatenate((z, np.concatenate((D1, D2), 1)), 1)
+            A = np.dot(W,A)
+            rc = np.max(np.shape(A))*np.max(np.linalg.svd(A)[1])*eps
+            PinvA = np.linalg.pinv(A, rcond=rc)
+            P = np.dot(A , np.linalg.pinv(A, rcond=rc))
+            T_vec [q*T_len : (q+1)*T_len] = P.flatten()
+        writeBin(TinvMat , T_vec)
+
+def genPseudoInvMatsVar( winLen ,Ainv=None , Fmin = F0_MIN , Fmax = F0_MAX , F0=None):
+    
+    pInvMatsVar = []
+    AInvMats = []
+    Basis = Bases ( NUM_BASES_FUN , winLen)
+    z = np.ones((winLen, 1))
+    nH = NUMBER_OF_HARMONICS #number of Harmonics    
+    I = len(Basis[0,:])
+    D1 = np.zeros((winLen,nH*I))
+    D2 = np.zeros((winLen,nH*I))
+    fzero= np.arange(Fmin, Fmax+1, F0_RES, dtype=float)
+    t1= np.arange(1, winLen+1, 1, dtype=float)
+    t1=t1/fs
+    t2=np.arange(0, nH+1, 1, dtype=float)
+    X1, Y1 = np.meshgrid(t2,t1)
+    if WINDOW == 'hanning':
+        win = np.hanning(winLen)
+        W = np.diag(win)
+    elif WINDOW == 'rect':
+        win = np.ones((winLen),)
+        W = np.diag(win)
+    if F0!=None:
+        fzer0 = F0
+    for q in range(len(fzero)):
+        omega=2*np.pi*fzero[q]
+        Cos=np.cos(omega*X1*Y1)    # WIN_LEN x N_HRMNICS            
+        Sin=np.sin(omega*X1*Y1)    # WIN_LEN x N_HRMNICS
+            # Harmonics with time varying amplitudes, composed of I basis
+        for t in range(winLen):
+            for h in range(nH):
+                D1[t][h*I:(h+1)*I] = Cos[t,h] * Basis[t]  #D1: M x (nH*I)
+                D2[t][h*I:(h+1)*I] = Sin[t,h] * Basis[t]  #D1: M x (nH*I)     
+        A = np.concatenate((z, np.concatenate((D1, D2), 1)), 1)
+        A = np.dot(W,A)
+        rc = np.max(np.shape(A))*np.max(np.linalg.svd(A)[1])*eps
+        PinvA = np.linalg.pinv(A, rcond=rc)
+        P = np.dot(A , np.linalg.pinv(A, rcond=rc))
+        pInvMatsVar.append(P)
+        AInvMats.append(PinvA)
+    if Ainv != None:
+        return pInvMatsVar , AInvMats
+    else: return pInvMatsVar
+
+def genPseudoInvMats( winLen , Ainv=None , window=None , Fmin = F0_MIN , Fmax = F0_MAX):
+        '''Compute and cache pInvMats for all candidate pitch values'''
+        pInvMats = []
+        AInvMats = []
+        fzero= np.arange(Fmin, Fmax+1, F0_RES, dtype=float)
+        t1= np.arange(1, winLen+1, 1, dtype=float)
+        t1=t1/fs
+        t2=np.arange(0, NUMBER_OF_HARMONICS+1, 1, dtype=float)
+        X1, Y1 = np.meshgrid(t2,t1)
+        if WINDOW == 'hanning':
+            win = np.hanning(winLen)
+            W = np.diag(win)
+        elif WINDOW == 'rect':
+            win = np.ones((winLen),)
+            W = np.diag(win)
+        for q in range(len(fzero)):
+            omega=2*np.pi*fzero[q]
+            Cos=np.cos(omega*X1*Y1)    # WIN_LEN x N_HRMNICS
+            Sin=np.sin(omega*X1*Y1)    # WIN_LEN x N_HRMNICS
+            A=np.c_[Cos,Sin[:,1:]]
+            A = np.dot(W,A)
+            rc = np.max(np.shape(A))*np.max(np.linalg.svd(A)[1])*eps
+            PinvA = np.linalg.pinv(A, rcond=rc)
+            P =  np.dot(A , np.linalg.pinv(A, rcond=rc)) 
+            pInvMats.append(P)
+            AInvMats.append(PinvA)
+        
+        if Ainv != None:
+            return pInvMats , AInvMats
+        else: return pInvMats
+
+def genPseudoInvMatsToFile( winLen , Fmin = F0_MIN , Fmax = F0_MAX):
+        '''Compute and cache pInvMats for all candidate pitch values'''
+        global TinvMat
+        TinvMat = TinvMatDir +'TinvMat_'+ TYPE_of_MODEL+'_'+str(fs)+'Hz'+'_'+str(winLen)+'FL'+'_'+'F0res'+str(F0_RES)+'Hz_'+'F0min'+str(F0_MIN)+'Hz_'+'F0max'+str(F0_MAX)+'Hz_'+'nH'+str(NUMBER_OF_HARMONICS)+'_'+WINDOW+'.bin'
+        if not os.path.isfile(TinvMat):
+            pInvMats = []
+            fzero= np.arange(Fmin, Fmax+1, F0_RES, dtype=float)
+            T_len = (2*NUMBER_OF_HARMONICS +1)*winLen
+            T_vec = np.empty((T_len*len(fzero) , ))
+            t1= np.arange(1, winLen+1, 1, dtype=float)
+            t1=t1/fs
+            t2=np.arange(0, NUMBER_OF_HARMONICS+1, 1, dtype=float)
+            X1, Y1 = np.meshgrid(t2,t1)
+            if WINDOW == 'hanning':
+                win = np.hanning(winLen)
+                W = np.diag(win)
+            elif WINDOW == 'rect':
+                win = np.ones((winLen),)
+                W = np.diag(win)
+            for q in range(len(fzero)):
+                omega=2*np.pi*fzero[q]
+                Cos=np.cos(omega*X1*Y1)    # WIN_LEN x N_HRMNICS 
+                Sin=np.sin(omega*X1*Y1)    # WIN_LEN x N_HRMNICS      
+                A=np.c_[Cos,Sin[:,1:]]
+                A = np.dot(W,A)
+                tmp = np.linalg.inv(LA.sqrtm( np.dot(A.T,A) ) )
+                T = np.dot( tmp , A.T).real # P = np.dot(T.T ,T)      
+                T_vec [q*T_len : (q+1)*T_len] = T.flatten()  
+            writeBin(TinvMat , T_vec)
+
+def genPinvA( winLen  , Fmin = F0_MIN , Fmax = F0_MAX):
+        AInvMats = []
+        fzero= np.arange(Fmin, Fmax+1, F0_RES, dtype=float)
+        t1= np.arange(1, winLen+1, 1, dtype=float)
+        t1=t1/fs
+        t2=np.arange(0, NUMBER_OF_HARMONICS+1, 1, dtype=float)
+        X1, Y1 = np.meshgrid(t2,t1)
+        win = np.hanning(winLen)
+        W = np.diag(win)
+        for q in range(len(fzero)):
+               omega=2*np.pi*fzero[q]
+               Cos=np.cos(omega*X1*Y1)    # WIN_LEN x N_HRMNICS        
+               Sin=np.sin(omega*X1*Y1)    # WIN_LEN x N_HRMNICS  
+               A=np.c_[Cos,Sin[:,1:]]
+               A = np.dot(W,A)
+               rc = np.max(np.shape(A))*np.max(np.linalg.svd(A)[1])*eps
+               PinvA = np.linalg.pinv(A, rcond=rc)
+               AInvMats.append(PinvA)
+        return AInvMats
+
+def genPseudoInvMats_map( winLen , Lambda , Mean ,  Fmin = F0_MIN , Fmax = F0_MAX ):
+    '''Compute and cache pInvMats for all candidate pitch values'''
+    pInvMats = []
+    penalty = []
+    fzero= np.arange( Fmin, Fmax+1, F0_RES, dtype=float)
+    t1= np.arange(1, winLen+1, 1, dtype=float)
+    t1=t1/fs
+    t2=np.arange(0, NUMBER_OF_HARMONICS+1, 1, dtype=float)
+    X1, Y1 = np.meshgrid(t2,t1)
+    if WINDOW == 'hanning':
+        win = np.hanning(winLen)
+        W = np.diag(win)
+    elif WINDOW == 'rect':
+        win = np.ones((winLen),)
+        W = np.diag(win)
+    for q in range(len(fzero)):
+        omega=2*np.pi*fzero[q]
+        Cos=np.cos(omega*X1*Y1)    # WIN_LEN x N_HRMNICS         
+        Sin=np.sin(omega*X1*Y1)    # WIN_LEN x N_HRMNICS        
+        A=np.c_[Cos,Sin[:,1:]]
+        A = np.dot(W,A)
+        rc = np.max(np.shape(A))*np.max(np.linalg.svd(A)[1])*eps
+        d = np.dot (A , np.linalg.inv(np.dot(A.T,A)+Lambda) )
+        P = np.dot( d , A.T)
+        pen = np.dot( np.dot(d , Lambda) , Mean)
+        pInvMats.append(P)
+        penalty.append(pen)
+        #pdb.set_trace()
+    return pInvMats , penalty
+
+def silDetection(Frames):
+    if SIL_ENG:
+        pw = 10 * np.log10(np.mean(Frames * Frames,1))
+        sil = pw < SIL_THRESHOLD  #silence detection
+    else:
+        sil = pw > 100
+    if ENTROPY :
+        entropy = entropyEstimation(Frames)
+        sil_entropy= entropy > ENTROPY_THR
+        sil = np.logical_or(sil,sil_entropy)
+    no_sil =  np.logical_not(sil) # not silence (either voiced or unvoiced or even noise)
+    return np.where(sil==True)[0], np.where(no_sil==True)[0]
+
+def getf0Features(  frames  , Fs ,  Fmin = F0_MIN , Fmax = F0_MAX , voiceProb= None , PitchDetction= None):
+    global fs
+    fs = Fs
+    nframe , FL = frames.shape
+    sil_ind , sp_ind = silDetection(frames)
+    noise_var , noise_var_min = NoiseVarianceEstimation(frames[sp_ind])
+    LL = -FL/2*np.log(noise_var)
+    #hard_pitch = F0_MIN + (np.argmax(LL,0))*F0_RES
+    #######################################################
+    if PitchDetction :
+      pitch = np.zeros(( nframe ))
+      pitch[sp_ind] =  F0_MIN + F0_RES * viterbi(LL, genTransMat(SIGMA_TRANS \
+                                                     , Fmin = F0_MIN , Fmax = F0_MAX ) , ret='pitch')
+    ######################################################
+    vuvll = np.zeros((2,len(sp_ind)))
+    E_Y = np.sum(frames[sp_ind] ** 2, 1)
+    vuvll[0] = np.log(E_Y - noise_var_min ) # Reconsrtucted signal Energy (voiced state)
+    vuvll[1] = np.log( noise_var_min ) # Noise Energy ( unvoiced state)     
+    vuvll[1] = vuvll[1,:] + VU_THRESHOLD
+    vuv = viterbi(vuvll, np.log(VUV_TRANSITION) , ret='vuv')
+    vuv1 = findUVerr(vuv) # smoothing
+    vIdx = np.nonzero(vuv == 1)[0]
+    uvIdx = np.nonzero(vuv == 0)[0]
+    vuv = np.zeros(( nframe ))
+    vuv[sp_ind] = vuv1
+    if voiceProb :
+        probvoice = vuvll[0,:]-vuvll[1,:] - VU_THRESHOLD
+        probvoice = featNormalize(probvoice,0.05,1)
+        prob_voice = np.zeros(( nframe ))
+        prob_voice[sp_ind] = probvoice
+        if np.all(np.isnan(prob_voice)):
+            print 'Nan in voicing probability '
+    if PitchDetction != None and voiceProb != None:
+        pitch[uvIdx]=0
+        return pitch , prob_voice , vuv
+    elif PitchDetction != None:
+        pitch[uvIdx]=0
+        return pitch , vuv
+    elif voiceProb != None:
+        return prob_voice , vuv
+    else: return   vuv
+
+def exactDetection(LL , f0):
+    cnt = len(f0)
+    exactF0 = np.zeros((cnt),)
+    bound = 5
+    #pdb.set_trace()
+    for i in xrange(cnt):
+            Maxs = MinMax(LL[:,i] , out='max')
+            exactF0[i] = Maxs[ np.argmin( np.abs( Maxs-f0[i] ) ) ]
+            #exactF0[i] =f0[i] +  np.argmax( LL[f0[i] - bound : f0[i] + bound , i] ) - bound
+    return exactF0
+
+def thr_adaptation(snr):
+        clean_thr = -.3
+        somewhat_noisy_thr = -.8
+        Noisy_thr = -1.2
+        veryNoisy_thr = -1.4 
+        if snr <= .3 : THR = veryNoisy_thr
+        elif snr > .3 and snr <= .5 : THR =  Noisy_thr
+        elif snr > .5 and snr <= 1 : THR =  somewhat_noisy_thr
+        else:  THR = clean_thr
+        return THR
+
+def genHarCofStat(HarCoff):
+    #pdb.set_trace()
+    Mean = np.mean(HarCoff,axis =0)                                
+    b_Sigma = np.dot((HarCoff-Mean).T,(HarCoff-Mean))/(np.shape(HarCoff)[0]-1) 
+    b_inv_Sig = np.linalg.inv(b_Sigma)                              
+    #Lambda_HM = b_inv_Sig*np.eye(len(b_inv_Sig))# why is not full cov? 
+    return Mean , b_inv_Sig
+
+def NoiseVarianceEstimation_map (  Frames , pInvMats , penalty, F_min=F0_MIN , F_max=F0_MAX  ): 
+
+    FL , nframe= np.shape(Frames)
+    pw = np.sum(Frames * Frames, 0)
+    cands = np.arange(F_min, F_max+1, F0_RES, dtype=float)
+    var = np.zeros((len(cands),nframe))
+    pitch = np.zeros((nframe, ))
+    for q in range(len(cands)):
+        Py =  np.dot(pInvMats[q],Frames)
+        gamma = penalty[q]
+        for i in range(nframe):
+            rec_energy = np.dot( (Py[:,i]+gamma).T , (Py[:,i]+gamma) )
+            var[q][i] = ( pw[i] - rec_energy)
+    sigma = np.min( var , 0 )
+    # Convoloution of the LL
+    cll_conv = np.zeros((len(cands),nframe))
+    Wnd = np.hamming(HAM_WND)
+    cll = var
+    half_wnd = len(Wnd)/2-1
+    for i  in range(nframe):
+        Conv = np.convolve(cll[:,i],Wnd,'valid')
+        tmp = np.ones(len(cands),)*np.max(Conv)
+        tmp[half_wnd : half_wnd + len(Conv)]  = Conv
+        cll_conv[:,i] = np.sqrt(np.dot(cll[:,i],cll[:,i].T)/(np.dot(tmp,tmp.T)+eps))*tmp
+
+    return cll_conv , sigma
+    
+def NoiseVarianceEstimation (  Frames , F_min=F0_MIN , F_max=F0_MAX  ):
+    nframe , FL = np.shape(Frames)
+    nframe  , FL  = np.shape(Frames)
+    if TYPE_of_MODEL == 'HM': genPseudoInvMatsToFile( FL , Fmin = F0_MIN , Fmax = F0_MAX)
+    elif TYPE_of_MODEL =='TVHM' : genPseudoInvMatsVarToFile( FL , Fmin = F0_MIN , Fmax = F0_MAX)
+    else: raise StandardError, " The model types has to be either HM or TVHM"
+
+    pw = np.sum(Frames * Frames, 1)
+    Wnd = np.hamming(HAM_WND)
+    half_wnd = len(Wnd)/2-1
+    cands = np.arange(F_min, F_max+1, F0_RES, dtype=float)
+    var = np.zeros((len(cands),nframe))
+    Tinv = readPinvMat ( TinvMat )
+    if TYPE_of_MODEL == 'HM':
+        for q in range(len(cands)):
+            Tmat = Tinv[q,:,:]  #(2*nH+1)*FL  the T matrix is loaded
+            for i in xrange(nframe):
+                rec = np.dot(Tmat ,Frames[i,:])
+                var[q][i]  = pw[i] -  np.dot(rec.T,rec)
+    elif TYPE_of_MODEL == 'TVHM':
+        for q in range(len(cands)):
+            P = Tinv[q,:,:]
+            #Py =  np.dot(Tinv[q,:,:],Frames.T) # the P matrix is loaded
+            for i in range(nframe):
+                #var[q][i] = ( pw[i] - np.dot(Frames[i,:].T ,Py[:,i]) )
+                frm = Frames[i,:]
+                var[q][i] = ( np.dot(frm.T,frm) - np.dot(frm.T , np.dot(P,frm)) )
+    #### conv ####                                           
+    cll_conv = np.zeros((len(cands),nframe))
+    Wnd = np.hamming(HAM_WND)
+    cll = var
+    half_wnd = len(Wnd)/2-1
+    for i  in range(nframe):
+        Conv = np.convolve(cll[:,i],Wnd,'valid')
+        tmp = np.ones(len(cands),)*np.max(Conv)
+        tmp[half_wnd : half_wnd + len(Conv)]  = Conv
+        cll_conv[:,i] = np.sqrt(np.dot(cll[:,i],cll[:,i].T)/(eps+np.dot(tmp,tmp.T)))*tmp
+    sigma = np.min( var , 0 )
+    return cll_conv , sigma
+
+    
+def getf0_MAP(  frames , Fs , Fmin = F0_MIN , Fmax = F0_MAX , voiceProb= False , PitchDetction= False):
+    global fs
+    fs = Fs
+    nframe , FL = frames.shape
+    sil_ind , sp_ind = silDetection(frames)
+    noise_var , noise_var_min = NoiseVarianceEstimation(frames[sp_ind])
+    noise_variance = np.mean(noise_var_min)
+    LL = -FL/2*np.log(noise_var)
+    pitch_idx = viterbi(LL, genTransMat(SIGMA_TRANS , Fmin = F0_MIN , Fmax = F0_MAX ) , ret='pitch')
+    HarCof = HARMONIC_COFF ( frames[sp_ind] , pitch_idx )
+    harCofMean , harCovInvMat = genHarCofStat(HarCof.T)
+    Lambda = noise_variance * harCovInvMat
+    pInvMats , Gamma = genPseudoInvMats_map( FL , Lambda , harCofMean  )
+    noise_var , noise_var_min = NoiseVarianceEstimation_map (  frames[sp_ind].T, pInvMats , Gamma , F_min = Fmin  , F_max = Fmax )
+    #pdb.set_trace()
+    LL = -FL/2*np.log(noise_var)
+    if PitchDetction :
+      pitch = np.zeros(( nframe ))
+      pitch[sp_ind] =  F0_MIN + F0_RES * viterbi(LL, genTransMat(SIGMA_TRANS \
+                                                     , Fmin = F0_MIN , Fmax = F0_MAX ) , ret='pitch')
+    ######################################################
+    vuvll = np.zeros((2,len(sp_ind)))
+    E_Y = np.sum(frames[sp_ind] ** 2, 1)
+    vuvll[0] = np.log(E_Y - noise_var_min ) # Reconsrtucted signal Energy (voiced state)                  
+    vuvll[1] = np.log( noise_var_min ) # Noise Energy ( unvoiced state)
+    vuvll[1] = vuvll[1,:] + VU_THRESHOLD
+    vuv = viterbi(vuvll, np.log(VUV_TRANSITION) , ret='vuv')
+    vuv1 = findUVerr(vuv) # smoothing
+    vIdx = np.nonzero(vuv == 1)[0]
+    uvIdx = np.nonzero(vuv == 0)[0]
+    vuv = np.zeros(( nframe ))
+    vuv[sp_ind] = vuv1
+    if voiceProb :
+        probvoice = vuvll[0,:]-vuvll[1,:] - VU_THRESHOLD
+        probvoice = featNormalize(probvoice,0.05,1)
+        prob_voice = np.zeros(( nframe ))
+        prob_voice[sp_ind] = probvoice
+        if np.all(np.isnan(prob_voice)):
+            print 'Nan in voicing probability '
+    if PitchDetction != None and voiceProb != None:
+        pitch[uvIdx]=0
+        return pitch , prob_voice , vuv
+    elif PitchDetction != None:
+        pitch[uvIdx]=0
+        return pitch , vuv
+    elif voiceProb != None:
+        return prob_voice , vuv
+    else: return   vuv
+
+def f0Estimation  (  var  ):
+    FL , nframe = np.shape(var)
+    f0 = np.zeros((nframe,))
+    #pdb.set_trace()
+    for frm in range(nframe):
+        vec = -var[:,frm]
+        f0[frm] =LobeAreaEstimate(vec) #+ F0_MIN
+    return f0
+
+def HARMONIC_COFF ( Frames   , pitch_idx  ):
+       nframe , FL  = np.shape(Frames)
+       PinvA = genPinvA( FL)
+       harCoeff = np.zeros((PinvA[0].shape[0] , nframe))
+       for i in range(nframe):
+           harCoeff[:,i] = np.dot (PinvA[int(pitch_idx[i])] , Frames[i,:]+eps )
+       return   harCoeff
+
+def getf0_unvoiced ( frames ):
+    nFrame , FL = frames.shape
+    var , var_min = NoiseVarianceEstimation (  frames , F_min = F0_MIN , F_max = F0_MAX )
+    I_max = np.argmin(var,0)
+    return I_max
+
+def viterbi(obs, trans , ret='vuv'):
+        m, n = np.shape(obs)
+        states    = np.zeros((m, n+1))
+        backtrace = np.zeros((m, n+1))
+        for i in range(1, n+1):
+                for j in range(m):
+                        delta = states[:, i-1] + trans[:, j]
+                        backtrace[j, i] = np.argmax(delta)
+                        states[j, i] = delta[backtrace[j, i]] + obs[j,i-1]
+        bestPath = np.zeros(n)
+        VUv_lable = np.zeros(n)
+        bestPath[n-1] = np.argmax(states[:, n] )
+        for i in range(n-2, -1, -1):
+                bestPath[i] = backtrace[bestPath[i+1], i+2]
+        out = bestPath
+        if ret == 'vuv':
+            for i in range (n):
+                if bestPath[i] < 1 :
+                    VUv_lable[i] = 1
+                else:
+                    VUv_lable[i] = 0
+            out = VUv_lable
+        return out
+
+def genTransMat(sig_tran , Fmin = F0_MIN , Fmax = F0_MAX):
+        fzero = np.arange(Fmin, Fmax+1, F0_RES, dtype=float)
+        nf0   = len(fzero)
+        pTrans = np.zeros((nf0, nf0))
+        for i in range(nf0):
+                for j in range(nf0):
+                        pTrans[i][j] =  -.5*np.log(2.0*np.pi*sig_tran*sig_tran) -  1/(2.0*sig_tran*sig_tran)* (fzero[i] - fzero[j])**2
+        return pTrans
+
+def writeBin( fn , vec , type = 'f'):
+    os.system('mkdir -p '+fn.split(fn.split('/')[-1])[0])
+    f = open(fn, 'wb')
+    for i in xrange(len(vec)):
+        f.write(struct.pack( type , vec[i] ))
+    f.close()
+
+def readBin ( fn  , fmt = 'f'):
+    fp = open(fn, 'rb')
+    wav = fp.read()
+    sampwidth = 4
+    fmt = 'f'
+    wav = struct.unpack('<%d%s' %(len(wav) / sampwidth, fmt), wav)
+    return wav
+
+def readPinvMat ( fname , Fmin = F0_MIN , Fmax = F0_MAX, F0_res = F0_RES ):
+    f0range = len(np.arange(Fmin, Fmax+1, F0_res))
+    FL = int(round(DEFAULT_FRAME_DUR * fs))
+    float_vec =  readBin ( fname , fmt = 'f')
+    if TYPE_of_MODEL == 'HM': pInvMats = np.resize(float_vec , (f0range , 2*NUMBER_OF_HARMONICS +1 , FL))
+    elif TYPE_of_MODEL =='TVHM' : pInvMats = np.resize(float_vec , (f0range , FL , FL))
+    else: raise StandardError, " The model types has to be either HM or TVHM"
+
+    return pInvMats
+                
+def segment (frames):
+    
+        frames[frames>0] = 1
+        voiced,unvoiced = computedurs(frames)
+        frames = abs(frames-1)
+        idx = np.nonzero(frames == 1)[0]
+        if len(idx) == 0: # the utt is all voiced
+            Noise = 0 
+            numOfwords = 1 
+            tot_noise = 0
+            return Noise  , numOfwords  , tot_noise 
+        else:
+            ind_a = np.zeros((len(idx)+1,1))
+            ind_b =np.zeros((len(idx)+1,1))
+            for i in range(len(idx)):
+                ind_a[i] = idx[i]
+                ind_b[i+1] = idx[i]
+        
+            ind_c = np.nonzero((ind_a - ind_b) != 1)[0]+1
+            tmp1 = np.ones((len(ind_c) , 1))
+            for i in range(len(ind_c)-1):
+                tmp1[i+1] = ind_c[i]
+            tmp2 = ind_c - 1
+            if tmp2[0] == 0:
+                tmp1 = tmp1[1:]
+                tmp2 = tmp2[1:]
+        
+            UV_noise = [] # unvoice or noise segments
+            for i in range(len(tmp2)):
+                out_n = str(idx[ int(tmp1[i][0]-1) ])+' '+str(idx[ int(tmp2[i]-1) ])+' '+str(int(tmp2[i]-tmp1[i][0]+1))
+                UV_noise.append(out_n)
+            UV_noiseDur = np.zeros((len(UV_noise),1))
+            for i in range(len(UV_noise)):
+                UV_noiseDur[i] = int(UV_noise[i].split()[2])       
+                noisVec = np.nonzero(UV_noiseDur > (MAX_UNVOICED_DUR / DEFAULT_FRAME_RATE) )[0]
+            tot_noise = 0
+            Noise = []
+            for i in range(len(noisVec)):
+                tot_noise = tot_noise + int(UV_noise[noisVec[i]].split()[2])
+                Noise.append(UV_noise[noisVec[i]])
+            if np.sum(frames) == 0: Noise.append(UV_noise[noisVec[i]])
+            if np.sum(frames) == 0: numOfwords = 1
+            elif np.sum(frames) == len(frames): numOfwords = 0 
+            else: numOfwords = len(UV_noise)
+            return Noise , numOfwords , tot_noise
+
+def findUVerr(vec,target=np.expand_dims(np.array([1,1,0,1,1]),1)):
+    ref_len = len(target)
+    vec_len = len(vec)
+    d = []
+    for f in xrange(vec_len - ref_len):
+        if np.dot(vec[f:ref_len+f].T , target ) == 4 and  vec[f:ref_len+f][2] == 0:
+            d.append(f+ref_len/2)
+    if len(d)!=0:
+        vec[np.array(d,int)] = 1
+    return vec
+        
+def MedianFilter (vector): # vector is a vector of zero and ones      
+        vector[np.nonzero(vector==0)[0]] = -1
+        tmp = np.zeros(len(vector),dtype=np.int)
+        if vector[0]==vector[1] and vector[1]==vector[2]:
+                tmp[0] = vector[0]
+                tmp[1] = vector[1]
+        else:
+                tmp[0] = int(np.sign(np.sum(vector[0:5])))
+                tmp[0] = int(np.sign(np.sum(vector[1:6])))
+        for i in range(2,len(vector)-2):
+                tmp[i] = int(np.sign( np.sum (vector[i:i+3]) + np.sum( tmp[i-
+2:i] )))
+        tmp[-2] = int(np.sign( np.sum(tmp[-5:-2]) + np.sum(vector[-2:] )))
+        tmp[-1] = int(np.sign( np.sum(tmp[-4:-1] + vector[-1]) ))
+        tmp[np.nonzero(tmp == -1)[0]] = 0
+        return tmp
+
+def vec_avg (Mat , WL):
+    nframe , FL = Mat.shape
+    W = np.ones((1,WL))
+    out = []
+    for i in range(np.fix(WL/2) , nframe - np.fix(WL/2)):
+            Dist = dist.pdist(np.r_[ np.r_[ Mat[i,:].reshape(1,FL) ,Mat[i-np.fix(WL/2):i , : ]],Mat[i+1:i+np.fix(WL/2)+1 ,:] ] )
+            out.append( np.sum(Dist[0:WL])/WL )
+    out = np.array(out, float)
+    return out
+
+def fileNameExt( name ):
+    name = name.strip()
+    tmp = name.split('/')
+    return name[len(name)-len(tmp[-1]):].strip()
+
+def fileDirExt (name):
+    name = name.strip()
+    tmp = name.split('/')
+    return name[0:len(name) - len(tmp[-1])]
+
+def maximaExt (mat):
+    FL , nframe = np.shape(mat)
+    nMaxMin = []
+    for i in range(nframe):
+        frm = mat[:,i]
+        Num = len (frm[numpy.r_[True, frm[1:] < frm[:-1]] & numpy.r_[frm[:-1] < frm[1:], True]] )
+        nMaxMin.append(Num)
+    return np.array(nMaxMin,int)
+
+def vec_avg1 (Mat , WL):
+    nframe , FL = Mat.shape
+    W = np.ones((1,WL))
+    out = []
+    run_win = np.sum( Mat[0:WL , :] , 0)
+    for i in range(np.fix(WL/2) , nframe - np.fix(WL/2)):
+        x = Mat[i , :]
+        Dist = WL*x*x -2*x*run_win+ run_win*run_win  # Dist = \sigma_{i=-wl/2}^{wl/2}/(x-x_i)^2                                                    
+        run_win = run_win - Mat[i-WL/2 , :] + Mat[WL/2+i , :]
+        out.append(( np.sum(Dist)/WL ) / 10e8 )
+    out = np.array(out, float)
+    return out
+
+def MinMax(data , out=None):
+    a = diff(sign(diff(data))).nonzero()[0] + 1 # local min+max
+    b = (diff(sign(diff(data))) > 0).nonzero()[0] + 1 # local min
+    c = (diff(sign(diff(data))) < 0).nonzero()[0] + 1 # local max
+    if out == 'max':
+        return c
+    elif out == 'min':
+        return b
+    elif out == 'all':
+        return a , b , c
+    else:
+        return a
+
+def Sinusoid(winLen, fzero, window=None ):
+        '''Compute and cache pInvMats for all candidate pitch values'''
+        nH = len(fzero)
+        t1= np.arange(1, winLen+1, 1, dtype=float)
+        t1=t1/fs
+        X1, Y1 = np.meshgrid(2*np.pi*fzero,t1)
+        if window!= None:
+            win = np.hanning(winLen)
+            W = np.diag(win)
+        else:
+            win = np.ones((winLen),)
+            W = np.diag(win)
+        Cos=np.cos(X1*Y1)    # WIN_LEN x N_HRMNICS
+        Sin=np.sin(X1*Y1)    # WIN_LEN x N_HRMNICS
+        A=np.c_[Cos,Sin[:,1:]]
+        A = np.dot(W,A)
+        rc = np.max(np.shape(A))*np.max(np.linalg.svd(A)[1])*eps
+        PinvA = np.linalg.pinv(A, rcond=rc)
+        P =  np.dot(A , np.linalg.pinv(A, rcond=rc))
+        return P
+
+def SinAnalysis( Frames  ):
+    nframe , FL = np.shape(Frames)
+    var = np.zeros((nframe,))
+    for i in range(nframe):
+        #pdb.set_trace()
+        frm = Frames[i,:]
+        FFT = abs(np.fft.fft(frm , fs)[0:fs/2])
+        maxFFT = MinMax (FFT , 'max' )
+        tmp = FFT[maxFFT].flatten('F') ; tmp.sort()
+        fzero = maxFFT[ np.where(FFT[maxFFT] > tmp[-NUMBER_OF_HARMONICS -1 ])[0] ]
+        P = Sinusoid( FL ,fzero )
+        #rec = np.dot(P,frm)
+        var[i] = ( np.dot(frm.T,frm) - np.dot(frm.T , np.dot(P,frm)) )/FL
+        #var[i] = ( np.dot(frm.T,frm) - np.dot(frm.T , np.dot(P,frm)) )/np.dot(frm.T,frm)
+    return var
+
+
+def LobeAreaEstimate ( vec ):
+    vec = vec-np.mean(vec)
+    minMax , Min , Max = MinMax (vec , 'all')
+    tmp = []
+    #pdb.set_trace()
+    if Min[0] < Max[0] : # if the first peak of  minMax is Min
+        if Min[-1] > Max[-1]: # the last peak of minMax is Min
+            for point in range(len(Max)):
+                area =  ( vec[Max[point]] - np.max([ vec[Min[point+1]] , vec[Min[point]] ]) ) * (Min[point+1] - Min[point])
+                tmp.append(area)
+            out = Max[argmax(tmp)]
+        else:
+            for point in range(len(Max)-1):
+                area =  ( vec[Max[point]] - np.max([ vec[Min[point+1]] , vec[Min[point]] ]) ) * (Min[point+1] - Min[point])
+                tmp.append(area)
+            out = Max[argmax(tmp)]
+    else: # the first peak of minMax is Max
+        if Min[-1] < Max[-1]: # the last peak of minMax is Max
+            for point in range(1 , len(Max)-1):
+                area =  ( vec[Max[point]] - np.max([ vec[Min[point-1]] , vec[Min[point]] ]) ) * (Min[point] - Min[point-1])
+                tmp.append(area)
+            out = Max[1:][argmax(tmp)]
+        else:
+            for point in range(1 , len(Max)):
+                area =  ( vec[Max[point]] - np.max([ vec[Min[point-1]] , vec[Min[point]] ]) ) * (Min[point] - Min[point-1])
+                tmp.append(area)
+            out = Max[1:][argmax(tmp)]
+
+    return out

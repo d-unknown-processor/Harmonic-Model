@@ -1,0 +1,219 @@
+"""
+written by: Meysam Asgari
+"""
+import numpy as np , pdb , wave
+from lib import readSpeech , readWavFile
+from HM import *
+
+execfile('/l2/users/asgari/Hiroko/src/cfg.py')
+
+def featureExtractor(fileName , *feats):
+    print fileName
+    if len(fileName.strip().split()) > 1:
+        outRoot = 'samePath'
+        fname , st , en = fileName.strip().split()
+        dir , wav = os.path.split(fname)
+        ifs = wave.open(fname).getframerate()
+        start = int(ifs*float(st))
+        end = int(ifs*float(en))
+        if outRoot == 'samePath':
+            root = dir+'/'+wav[:-4]+'_'+st+'_'+en
+        else:
+            root = ROOT + wav[:-4]+'_'+st+'_'+en
+        try:
+            nt, fs, sig = readWavFile(fname , start , end-start)
+        except  Exception as Err:
+            error = open(root + '.err_wav' , "w")
+            error.write("%s\n" %(str(Err)))
+            error.close()
+            sys.exit('wave file has a error')
+    else:
+        sig , fs = readWave(fileName)
+    sig = sig+eps
+
+    LP_frames  = readSpeech(sig)
+    frames = getframes1(sig)
+    nframe,FL = frames.shape
+    #outFeats = np.empty(())
+    outFeats = np.zeros((nframe,1))
+    harCof = None; vuv = None
+    ## f0 and voicing probability and voiced labels   
+    if 'f0' in feats and 'voicingProb' in feats:
+        f0 , voicingProb , vuv = getf0Features ( LP_frames , fs, voiceProb = True , PitchDetction = True)
+    elif 'f0' in feats:
+        f0 , vuv = getf0Features ( LP_frames ,fs , PitchDetction = True)
+    elif 'voicingProb' in feats:
+        voicingProb , vuv = getf0Features ( LP_frames , fs  , voiceProb = True)
+    elif 'voiced_labels' in feats and not 'harmCoeff' in feats:
+        vuv = getf0Features ( LP_frames , fs)
+
+    ## entropy     
+    if 'entropy' in feats:
+        w_frames = getframes1(sig,WINDOW='hanning')
+        entropy= logspectralentropy(w_frames)
+
+    ## Harmonic coefficients                                 
+    if 'harmCoeff' in feats:
+        if not 'f0' in feats:
+                f0 , vuv = getf0Features ( LP_frames , fs  , PitchDetction = True)
+                pitch_idx = f0.copy()
+                pitch_idx[f0>0] = (f0[f0>0] - F0_MIN) / F0_RES
+                pitch_idx[f0==0] = getf0_unvoiced ( LP_frames[f0==0,:]  )
+                #harCof = HARMONIC_COFF ( frames , pitch_idx ).flatten()
+                harCof = np.log(np.abs(HARMONIC_COFF ( frames , pitch_idx ))).T
+        else:
+                pitch_idx = (f0 - F0_MIN) / F0_RES
+                pitch_idx[f0==0] = getf0_unvoiced ( LP_frames[f0==0,:] )
+                #harCof = HARMONIC_COFF ( frames  , pitch_idx ).flatten()
+                harCof = np.log(np.abs(HARMONIC_COFF ( frames  , pitch_idx ))).T
+    ## MAP estimation-- it now supports HM not TVHM!
+    ## f0 and voicing probability and voiced labels
+    if 'f0_map' in feats and 'voicingProb_map' in feats:
+        f0_map , voicingProb_map , vuv_map = getf0_MAP ( LP_frames , fs, voiceProb = True , PitchDetction = True)
+    elif 'f0_map' in feats:
+        f0_map , vuv_map = getf0_MAP ( LP_frames ,fs , PitchDetction = True)
+    elif 'voicingProb_map' in feats:
+        voicingProb_map , vuv_map = getf0_MAP ( LP_frames , fs  , voiceProb = True)
+    elif 'voiced_labels_map' in feats and not 'harmCoeff' in feats:
+        vuv_map = getf0_MAP ( LP_frames , fs)
+
+    ## jitter
+    '''if 'jitter' in feats:
+        if not 'f0' in feats:
+            f0 , vuv = getf0Features ( frames  , PitchDetction = True)
+        pitch_idx = f0[f0>0].copy()
+        pitch_idx = (pitch_idx - F0_MIN) / F0_RES
+        vidx=np.where(f0>0)[0]
+        Tinv = readPinvMat ( TinvMat )
+        jitter = np.zeros((nframe,))
+        for i in range(len(pitch_idx)):
+            q = pitch_idx[i]
+            denoised = np.dot(np.dot(Tinv[q , : ,:].T , Tinv[q , : ,:]) , frames[vidx[i],:])
+            jitter[vidx[i]] = computeJitter( denoised , f0[vidx[i]] ,fs)'''
+    
+    ###jitter, shimmer,HNR, H12
+    if ('shimmer' or 'jitter' or 'HNR' or 'H1H2') in feats:
+        if not 'f0' in feats:                                                    
+            f0 , vuv = getf0Features ( LP_frames, fs , PitchDetction = True)                   
+        pitch_idx = f0[f0>0].copy()                                         
+        pitch_idx = (pitch_idx - F0_MIN) / F0_RES   
+        vidx=np.where(f0>0)[0]
+        HNR = np.zeros((nframe,))
+        H12 = np.zeros((nframe,))
+        shimmer = np.zeros((nframe,))
+        jitter = np.zeros((nframe,))
+        HNR[vidx], H12[vidx], shimmer[vidx], jitter[vidx] = Harmonicity(None,frames,f0,fs)
+        
+    ## delta_f0  
+    if 'delta_f0' in feats:
+        if not 'f0' in feats:
+            f0 , vuv = getf0Features ( LP_frames , fs  , PitchDetction = True)
+        d_f0 = delta(f0)
+        
+    ## delta_voicingProb
+    if 'delta_voicingProb' in feats:
+        if voicingProb is None:
+            voicingProb , vuv = getf0Features ( LP_frames , fs  ,voiceProb = True )
+        d_voicingProb = delta(voicingProb)
+        
+   ## delta_entropy
+    if 'delta_entropy' in feats:
+        if entropy is None:
+            entropy= logspectralentropy(frames)
+        d_entropy = delta(entropy)
+        
+    ### RMS
+    if 'RMS' in feats:
+        RMS = computeRMS(frames)
+    ### MFCC (signal, samplerate=16000, winlen=0.025, winstep=0.01, numcep=13, nfilt=26, nfft=512, lowfreq=0, highfreq=None, preemph=0.97, ceplifter=22, appendEnergy=True)
+    if 'MFCC' in feats:
+        from features import mfcc
+        from features import logfbank
+        MFCC = mfcc(sig,fs,DEFAULT_FRAME_DUR,DEFAULT_FRAME_RATE)
+        if MFCC.shape[0] > frames.shape[0]:
+            MFCC = MFCC[0:frames.shape[0]]
+        MFCC = MFCC
+    ## delta_mfcc
+    if 'delta_MFCC' in feats:
+        if MFCC is None:
+            MFCC = mfcc(sig,fs,DEFAULT_FRAME_DUR,DEFAULT_FRAME_RATE)
+        d_mfcc = delta(MFCC)
+    ## delta_delta_mfcc
+    if 'delta_delta_MFCC' in feats:
+        if d_mfcc is None:
+            d_mfcc = delta(mfcc(sig,fs,DEFAULT_FRAME_DUR,DEFAULT_FRAME_RATE))
+        dd_mfcc = delta(d_mfcc)       
+    ### TEO
+    if 'TEO' in feats:
+        from TEO_CR_AC import TEO_CR
+        if  vuv==None:
+            vuv = getf0Features ( LP_frames , fs)
+        TEO = TEO_CR(sig,vuv,fs)
+    ##############################################################    
+    ################ Stacking the features ########################
+    if 'voiced_labels' in feats:
+        outFeats = np.c_[outFeats,vuv]
+    if 'f0' in feats:
+        outFeats = np.c_[outFeats,f0]
+    if 'voicingProb' in feats:
+        outFeats = np.c_[outFeats,voicingProb]
+    if 'delta_voicingProb' in feats:
+        outFeats = np.c_[outFeats,d_voicingProb]
+    if 'RMS' in feats:
+        outFeats = np.c_[outFeats,RMS]
+    if 'delta_f0' in feats :
+        outFeats = np.c_[outFeats,d_f0]
+    if 'entropy' in feats :
+        outFeats = np.c_[outFeats,entropy]
+    if 'delta_entropy' in feats:
+        outFeats = np.c_[outFeats,d_entropy]
+    if 'jitter' in feats:
+        outFeats = np.c_[outFeats,jitter]
+    if 'shimmer' in feats:
+        outFeats = np.c_[outFeats,shimmer]
+    if 'HNR' in feats:
+        outFeats = np.c_[outFeats,HNR]
+    if 'H1H2' in feats:
+        outFeats = np.c_[outFeats,H12]
+    if 'harmCoeff' in feats:
+        outFeats = np.c_[outFeats,harCof]
+    if 'voiced_labels_map' in feats:
+        outFeats = np.c_[outFeats,vuv_map]
+    if 'f0_map' in feats:
+        outFeats = np.c_[outFeats,f0_map]
+    if 'voicingProb_map' in feats:
+        outFeats = np.c_[outFeats,voicingProb_map]
+    if 'TEO' in feats:
+        outFeats = np.c_[outFeats,TEO]
+    if 'MFCC' in feats:
+        outFeats = np.c_[outFeats,MFCC]
+    if 'delta_MFCC' in feats:
+        outFeats = np.c_[outFeats,d_mfcc]
+    if 'delta_delta_MFCC' in feats:
+        outFeats = np.c_[outFeats,dd_mfcc]
+    return outFeats[:,1:]
+                 
+def Parser ( parser ):
+    parser.add_option("-a", "--wList", dest="WavList", help="read .list text file")
+    parser.add_option("-j", "--nJob", dest="numOfJob", help="read the job's number")
+    parser.add_option("-n", "--nProc", dest="numOfProcessors", help="read the total num of processors")
+    (options,args) = parser.parse_args()
+
+    wavList = options.WavList
+    nJob =  options.numOfJob
+    nProc =  options.numOfProcessors
+    if nJob is None: nJob = 0
+    else: nJob = int ( nJob )
+    if nProc is None: nProc = 1
+    else: nProc = int( nProc )
+
+    fip = open(wavList , "r")
+    lines=fip.readlines()
+    nFiles = len(lines)
+    t1=np.arange(0,nFiles) % nProc
+    list1 = np.nonzero(t1 == nJob)[0]
+    fip.close()
+    fnames=[]
+    for line in range(len(list1)):
+        fnames.append(lines[list1[line]].strip())
+    return fnames

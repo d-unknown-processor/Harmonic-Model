@@ -1,0 +1,2 @@
+wav_samples/f1nw0000_8k.wav
+wav_samples/m1nw0000_8k.wav
