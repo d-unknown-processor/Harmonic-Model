@@ -8,7 +8,7 @@ from scipy.fftpack import rfft, irfft
 # import matplotlib
 # matplotlib.use("PDF")
 # from matplotlib import mlab as mlab, pylab as plt
-execfile('/l2/users/asgari/Hiroko/src/cfg.py')
+execfile('./src/cfg.py')
 
 from scipy.signal import lfilter, firwin , medfilt
 
